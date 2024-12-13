@@ -26,7 +26,7 @@ type HostState struct {
 	UdpConnCount   uint64
 	ProcessCount   uint64
 	Temperatures   []SensorTemperature
-	GPU            float64
+	GPU            []float64
 }
 
 func (s *HostState) PB() *pb.State {
@@ -69,8 +69,6 @@ type Host struct {
 	Arch            string
 	Virtualization  string
 	BootTime        uint64
-	IP              string `json:"-"`
-	CountryCode     string
 	Version         string
 	GPU             []string
 }
@@ -86,9 +84,17 @@ func (h *Host) PB() *pb.Host {
 		Arch:            h.Arch,
 		Virtualization:  h.Virtualization,
 		BootTime:        h.BootTime,
-		Ip:              h.IP,
-		CountryCode:     h.CountryCode,
 		Version:         h.Version,
 		Gpu:             h.GPU,
 	}
+}
+
+type GeoIP struct {
+	IP          IP     `json:"ip,omitempty"`
+	CountryCode string `json:"country_code,omitempty"`
+}
+
+type IP struct {
+	IPv4Addr string `json:"ipv4_addr,omitempty"`
+	IPv6Addr string `json:"ipv6_addr,omitempty"`
 }

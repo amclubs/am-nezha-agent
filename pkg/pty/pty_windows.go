@@ -5,7 +5,6 @@ package pty
 import (
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,14 +19,10 @@ import (
 	"github.com/shirou/gopsutil/v4/host"
 )
 
-var isWin10 bool
+var _ IPty = (*winPTY)(nil)
+var _ IPty = (*conPty)(nil)
 
-type Pty interface {
-	Write(p []byte) (n int, err error)
-	Read(p []byte) (n int, err error)
-	Setsize(cols, rows uint32) error
-	Close() error
-}
+var isWin10 = VersionCheck()
 
 type winPTY struct {
 	tty *winpty.WinPTY
@@ -35,10 +30,6 @@ type winPTY struct {
 
 type conPty struct {
 	tty *conpty.ConPty
-}
-
-func init() {
-	isWin10 = VersionCheck()
 }
 
 func VersionCheck() bool {
@@ -62,12 +53,11 @@ func VersionCheck() bool {
 	return false
 }
 
-func DownloadDependency() {
+func DownloadDependency() error {
 	if !isWin10 {
 		executablePath, err := getExecutableFilePath()
 		if err != nil {
-			fmt.Println("NEZHA>> wintty 获取文件路径失败", err)
-			return
+			return fmt.Errorf("winpty 获取文件路径失败: %v", err)
 		}
 
 		winptyAgentExe := filepath.Join(executablePath, "winpty-agent.exe")
@@ -76,27 +66,23 @@ func DownloadDependency() {
 		fe, errFe := os.Stat(winptyAgentExe)
 		fd, errFd := os.Stat(winptyAgentDll)
 		if errFe == nil && fe.Size() > 300000 && errFd == nil && fd.Size() > 300000 {
-			return
+			return fmt.Errorf("winpty 文件完整性检查失败")
 		}
 
 		resp, err := http.Get("https://github.com/rprichard/winpty/releases/download/0.4.3/winpty-0.4.3-msvc2015.zip")
 		if err != nil {
-			log.Println("NEZHA>> wintty 下载失败", err)
-			return
+			return fmt.Errorf("winpty 下载失败: %v", err)
 		}
 		defer resp.Body.Close()
 		content, err := io.ReadAll(resp.Body)
 		if err != nil {
-			log.Println("NEZHA>> wintty 下载失败", err)
-			return
+			return fmt.Errorf("winpty 下载失败: %v", err)
 		}
 		if err := os.WriteFile("./wintty.zip", content, os.FileMode(0777)); err != nil {
-			log.Println("NEZHA>> wintty 写入失败", err)
-			return
+			return fmt.Errorf("winpty 写入失败: %v", err)
 		}
 		if err := unzip.New("./wintty.zip", "./wintty").Extract(); err != nil {
-			fmt.Println("NEZHA>> wintty 解压失败", err)
-			return
+			return fmt.Errorf("winpty 解压失败: %v", err)
 		}
 		arch := "x64"
 		if runtime.GOARCH != "amd64" {
@@ -108,6 +94,7 @@ func DownloadDependency() {
 		os.RemoveAll("./wintty")
 		os.RemoveAll("./wintty.zip")
 	}
+	return nil
 }
 
 func getExecutableFilePath() (string, error) {
@@ -118,7 +105,7 @@ func getExecutableFilePath() (string, error) {
 	return filepath.Dir(ex), nil
 }
 
-func Start() (Pty, error) {
+func Start() (IPty, error) {
 	shellPath, err := exec.LookPath("powershell.exe")
 	if err != nil || shellPath == "" {
 		shellPath = "cmd.exe"
@@ -143,6 +130,10 @@ func (w *winPTY) Read(p []byte) (n int, err error) {
 	return w.tty.StdOut.Read(p)
 }
 
+func (w *winPTY) Getsize() (uint16, uint16, error) {
+	return 80, 40, nil
+}
+
 func (w *winPTY) Setsize(cols, rows uint32) error {
 	w.tty.SetSize(cols, rows)
 	return nil
@@ -159,6 +150,10 @@ func (c *conPty) Write(p []byte) (n int, err error) {
 
 func (c *conPty) Read(p []byte) (n int, err error) {
 	return c.tty.Read(p)
+}
+
+func (c *conPty) Getsize() (uint16, uint16, error) {
+	return 80, 40, nil
 }
 
 func (c *conPty) Setsize(cols, rows uint32) error {

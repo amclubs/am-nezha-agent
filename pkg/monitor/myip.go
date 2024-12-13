@@ -1,69 +1,75 @@
 package monitor
 
 import (
-	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/nezhahq/agent/pkg/logger"
 	"github.com/nezhahq/agent/pkg/util"
+	pb "github.com/nezhahq/agent/proto"
 )
-
-const MacOSChromeUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
 
 var (
 	cfList = []string{
 		"https://blog.cloudflare.com/cdn-cgi/trace",
-		"https://dash.cloudflare.com/cdn-cgi/trace",
-		"https://cf-ns.com/cdn-cgi/trace", // 有国内节点
+		"https://developers.cloudflare.com/cdn-cgi/trace",
+		"https://hostinger.com/cdn-cgi/trace",
+		"https://ahrefs.com/cdn-cgi/trace",
 	}
-	CachedIP, GeoQueryIP, CachedCountryCode string
-	httpClientV4                            = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, false)
-	httpClientV6                            = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, true)
+	CustomEndpoints               []string
+	GeoQueryIP, CachedCountryCode string
+	GeoQueryIPChanged             bool = true
+	httpClientV4                       = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, false)
+	httpClientV6                       = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, true)
 )
 
 // UpdateIP 按设置时间间隔更新IP地址的缓存
-func UpdateIP(useIPv6CountryCode bool, period uint32) {
-	for {
-		util.Println(agentConfig.Debug, "正在更新本地缓存IP信息")
-		wg := new(sync.WaitGroup)
-		wg.Add(2)
-		var ipv4, ipv6 string
-		go func() {
-			defer wg.Done()
+func FetchIP(useIPv6CountryCode bool) *pb.GeoIP {
+	logger.DefaultLogger.Println("正在更新本地缓存IP信息")
+	wg := new(sync.WaitGroup)
+	wg.Add(2)
+	var ipv4, ipv6 string
+	go func() {
+		defer wg.Done()
+		if len(CustomEndpoints) > 0 {
+			ipv4 = fetchIP(CustomEndpoints, false)
+		} else {
 			ipv4 = fetchIP(cfList, false)
-		}()
-		go func() {
-			defer wg.Done()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if len(CustomEndpoints) > 0 {
+			ipv6 = fetchIP(CustomEndpoints, true)
+		} else {
 			ipv6 = fetchIP(cfList, true)
-		}()
-		wg.Wait()
-
-		if ipv4 == "" && ipv6 == "" {
-			if period > 60 {
-				time.Sleep(time.Minute)
-			} else {
-				time.Sleep(time.Second * time.Duration(period))
-			}
-			continue
 		}
+	}()
+	wg.Wait()
 
-		if ipv4 == "" || ipv6 == "" {
-			CachedIP = fmt.Sprintf("%s%s", ipv4, ipv6)
-		} else {
-			CachedIP = fmt.Sprintf("%s/%s", ipv4, ipv6)
-		}
-
-		if ipv6 != "" && (useIPv6CountryCode || ipv4 == "") {
-			GeoQueryIP = ipv6
-		} else {
-			GeoQueryIP = ipv4
-		}
-
-		time.Sleep(time.Second * time.Duration(period))
+	if ipv6 != "" && (useIPv6CountryCode || ipv4 == "") {
+		GeoQueryIPChanged = GeoQueryIP != ipv6 || GeoQueryIPChanged
+		GeoQueryIP = ipv6
+	} else {
+		GeoQueryIPChanged = GeoQueryIP != ipv4 || GeoQueryIPChanged
+		GeoQueryIP = ipv4
 	}
+
+	if GeoQueryIP != "" {
+		return &pb.GeoIP{
+			Use6: useIPv6CountryCode,
+			Ip: &pb.IP{
+				Ipv4: ipv4,
+				Ipv6: ipv6,
+			},
+		}
+	}
+
+	return nil
 }
 
 func fetchIP(servers []string, isV6 bool) string {
@@ -88,20 +94,28 @@ func fetchIP(servers []string, isV6 bool) string {
 				continue
 			}
 			resp.Body.Close()
-			lines := strings.Split(string(body), "\n")
+
+			bodyStr := string(body)
 			var newIP string
-			for _, line := range lines {
-				if strings.HasPrefix(line, "ip=") {
-					newIP = strings.TrimPrefix(line, "ip=")
-					break
+
+			if !strings.Contains(bodyStr, "ip=") {
+				newIP = strings.TrimSpace(strings.ReplaceAll(bodyStr, "\n", ""))
+			} else {
+				lines := strings.Split(bodyStr, "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "ip=") {
+						newIP = strings.TrimPrefix(line, "ip=")
+						break
+					}
 				}
 			}
+			parsedIP := net.ParseIP(newIP)
 			// 没取到 v6 IP
-			if isV6 && !strings.Contains(newIP, ":") {
+			if isV6 && (parsedIP == nil || parsedIP.To4() != nil) {
 				continue
 			}
 			// 没取到 v4 IP
-			if !isV6 && !strings.Contains(newIP, ".") {
+			if !isV6 && (parsedIP == nil || parsedIP.To4() == nil) {
 				continue
 			}
 			ip = newIP
@@ -116,6 +130,6 @@ func httpGetWithUA(client *http.Client, url string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Add("User-Agent", MacOSChromeUA)
+	req.Header.Add("User-Agent", util.MacOSChromeUA)
 	return client.Do(req)
 }

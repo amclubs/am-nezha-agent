@@ -11,7 +11,8 @@ const (
 	TaskTypeKeepalive
 	TaskTypeTerminalGRPC
 	TaskTypeNAT
-	TaskTypeReportHostInfo
+	TaskTypeReportHostInfoDeprecated
+	TaskTypeFM
 )
 
 type TerminalTask struct {
@@ -21,4 +22,8 @@ type TerminalTask struct {
 type TaskNAT struct {
 	StreamID string
 	Host     string
+}
+
+type TaskFM struct {
+	StreamID string
 }

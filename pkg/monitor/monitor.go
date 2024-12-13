@@ -1,71 +1,65 @@
 package monitor
 
 import (
-	"fmt"
-	"math"
-	"os/exec"
+	"context"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
-	"github.com/dean2021/goss"
-	"github.com/shirou/gopsutil/v4/cpu"
-	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/host"
-	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
-	"github.com/shirou/gopsutil/v4/net"
 	"github.com/shirou/gopsutil/v4/process"
-	"github.com/shirou/gopsutil/v4/sensors"
 
 	"github.com/nezhahq/agent/model"
-	"github.com/nezhahq/agent/pkg/gpu"
-	gpustat "github.com/nezhahq/agent/pkg/gpu/stat"
-	"github.com/nezhahq/agent/pkg/util"
+	"github.com/nezhahq/agent/pkg/logger"
+	"github.com/nezhahq/agent/pkg/monitor/conn"
+	"github.com/nezhahq/agent/pkg/monitor/cpu"
+	"github.com/nezhahq/agent/pkg/monitor/disk"
+	"github.com/nezhahq/agent/pkg/monitor/gpu"
+	"github.com/nezhahq/agent/pkg/monitor/load"
+	"github.com/nezhahq/agent/pkg/monitor/nic"
+	"github.com/nezhahq/agent/pkg/monitor/temperature"
 )
 
 var (
-	Version           string
-	expectDiskFsTypes = []string{
-		"apfs", "ext4", "ext3", "ext2", "f2fs", "reiserfs", "jfs", "btrfs",
-		"fuseblk", "zfs", "simfs", "ntfs", "fat32", "exfat", "xfs", "fuse.rclone",
-	}
-	excludeNetInterfaces = []string{
-		"lo", "tun", "docker", "veth", "br-", "vmbr", "vnet", "kube",
-	}
+	Version     string
 	agentConfig *model.AgentConfig
+
+	printf = logger.DefaultLogger.Printf
 )
 
 var (
 	netInSpeed, netOutSpeed, netInTransfer, netOutTransfer, lastUpdateNetStats uint64
 	cachedBootTime                                                             time.Time
-	gpuStat                                                                    uint64
 	temperatureStat                                                            []model.SensorTemperature
 )
 
 // 获取设备数据的最大尝试次数
 const maxDeviceDataFetchAttempts = 3
 
+const (
+	CPU = iota + 1
+	GPU
+	Load
+	Temperatures
+)
+
 // 获取主机数据的尝试次数，Key 为 Host 的属性名
-var hostDataFetchAttempts = map[string]int{
-	"CPU": 0,
-	"GPU": 0,
+var hostDataFetchAttempts = map[uint8]uint8{
+	CPU: 0,
+	GPU: 0,
 }
 
 // 获取状态数据的尝试次数，Key 为 HostState 的属性名
-var statDataFetchAttempts = map[string]int{
-	"CPU":          0,
-	"Load":         0,
-	"GPU":          0,
-	"Temperatures": 0,
+var statDataFetchAttempts = map[uint8]uint8{
+	CPU:          0,
+	GPU:          0,
+	Load:         0,
+	Temperatures: 0,
 }
 
 var (
-	updateGPUStatus  int32
-	updateTempStatus int32
+	updateTempStatus = new(atomic.Bool)
 )
 
 func InitConfig(cfg *model.AgentConfig) {
@@ -79,7 +73,7 @@ func GetHost() *model.Host {
 	var cpuType string
 	hi, err := host.Info()
 	if err != nil {
-		println("host.Info error: ", err)
+		printf("host.Info error: %v", err)
 	} else {
 		if hi.VirtualizationRole == "guest" {
 			cpuType = "Virtual"
@@ -94,44 +88,18 @@ func GetHost() *model.Host {
 		ret.BootTime = hi.BootTime
 	}
 
-	cpuModelCount := make(map[string]int)
-	if hostDataFetchAttempts["CPU"] < maxDeviceDataFetchAttempts {
-		ci, err := cpu.Info()
-		if err != nil {
-			hostDataFetchAttempts["CPU"]++
-			println("cpu.Info error: ", err, ", attempt: ", hostDataFetchAttempts["CPU"])
-		} else {
-			hostDataFetchAttempts["CPU"] = 0
-			for i := 0; i < len(ci); i++ {
-				cpuModelCount[ci[i].ModelName]++
-			}
-			for model, count := range cpuModelCount {
-				if len(ci) > 1 {
-					ret.CPU = append(ret.CPU, fmt.Sprintf("%s %d %s Core", model, count, cpuType))
-				} else {
-					ret.CPU = append(ret.CPU, fmt.Sprintf("%s %d %s Core", model, ci[0].Cores, cpuType))
-				}
-			}
-		}
-	}
+	ctxCpu := context.WithValue(context.Background(), cpu.CPUHostKey, cpuType)
+	ret.CPU = tryHost(ctxCpu, CPU, cpu.GetHost)
 
 	if agentConfig.GPU {
-		if hostDataFetchAttempts["GPU"] < maxDeviceDataFetchAttempts {
-			ret.GPU, err = gpu.GetGPUModel()
-			if err != nil {
-				hostDataFetchAttempts["GPU"]++
-				println("gpu.GetGPUModel error: ", err, ", attempt: ", hostDataFetchAttempts["GPU"])
-			} else {
-				hostDataFetchAttempts["GPU"] = 0
-			}
-		}
+		ret.GPU = tryHost(context.Background(), GPU, gpu.GetHost)
 	}
 
-	ret.DiskTotal, _ = getDiskTotalAndUsed()
+	ret.DiskTotal = getDiskTotal()
 
 	mv, err := mem.VirtualMemory()
 	if err != nil {
-		println("mem.VirtualMemory error: ", err)
+		printf("mem.VirtualMemory error: %v", err)
 	} else {
 		ret.MemTotal = mv.Total
 		if runtime.GOOS != "windows" {
@@ -142,7 +110,7 @@ func GetHost() *model.Host {
 	if runtime.GOOS == "windows" {
 		ms, err := mem.SwapMemory()
 		if err != nil {
-			println("mem.SwapMemory error: ", err)
+			printf("mem.SwapMemory error: %v", err)
 		} else {
 			ret.SwapTotal = ms.Total
 		}
@@ -150,7 +118,6 @@ func GetHost() *model.Host {
 
 	cachedBootTime = time.Unix(int64(hi.BootTime), 0)
 
-	ret.IP = CachedIP
 	ret.Version = Version
 
 	return &ret
@@ -159,20 +126,14 @@ func GetHost() *model.Host {
 func GetState(skipConnectionCount bool, skipProcsCount bool) *model.HostState {
 	var ret model.HostState
 
-	if statDataFetchAttempts["CPU"] < maxDeviceDataFetchAttempts {
-		cp, err := cpu.Percent(0, false)
-		if err != nil || len(cp) == 0 {
-			statDataFetchAttempts["CPU"]++
-			println("cpu.Percent error: ", err, ", attempt: ", statDataFetchAttempts["CPU"])
-		} else {
-			statDataFetchAttempts["CPU"] = 0
-			ret.CPU = cp[0]
-		}
+	cp := tryStat(context.Background(), CPU, cpu.GetState)
+	if len(cp) > 0 {
+		ret.CPU = cp[0]
 	}
 
 	vm, err := mem.VirtualMemory()
 	if err != nil {
-		println("mem.VirtualMemory error: ", err)
+		printf("mem.VirtualMemory error: %v", err)
 	} else {
 		ret.MemUsed = vm.Total - vm.Available
 		if runtime.GOOS != "windows" {
@@ -183,32 +144,24 @@ func GetState(skipConnectionCount bool, skipProcsCount bool) *model.HostState {
 		// gopsutil 在 Windows 下不能正确取 swap
 		ms, err := mem.SwapMemory()
 		if err != nil {
-			println("mem.SwapMemory error: ", err)
+			printf("mem.SwapMemory error: %v", err)
 		} else {
 			ret.SwapUsed = ms.Used
 		}
 	}
 
-	_, ret.DiskUsed = getDiskTotalAndUsed()
+	ret.DiskUsed = getDiskUsed()
 
-	if statDataFetchAttempts["Load"] < maxDeviceDataFetchAttempts {
-		loadStat, err := load.Avg()
-		if err != nil {
-			statDataFetchAttempts["Load"]++
-			println("load.Avg error: ", err, ", attempt: ", statDataFetchAttempts["Load"])
-		} else {
-			statDataFetchAttempts["Load"] = 0
-			ret.Load1 = loadStat.Load1
-			ret.Load5 = loadStat.Load5
-			ret.Load15 = loadStat.Load15
-		}
-	}
+	loadStat := tryStat(context.Background(), Load, load.GetState)
+	ret.Load1 = loadStat.Load1
+	ret.Load5 = loadStat.Load5
+	ret.Load15 = loadStat.Load15
 
 	var procs []int32
 	if !skipProcsCount {
 		procs, err = process.Pids()
 		if err != nil {
-			println("process.Pids error: ", err)
+			printf("process.Pids error: %v", err)
 		} else {
 			ret.ProcessCount = uint64(len(procs))
 		}
@@ -220,14 +173,16 @@ func GetState(skipConnectionCount bool, skipProcsCount bool) *model.HostState {
 	}
 
 	if agentConfig.GPU {
-		go updateGPUStat(&gpuStat)
-		ret.GPU = math.Float64frombits(gpuStat)
+		ret.GPU = tryStat(context.Background(), GPU, gpu.GetState)
 	}
 
 	ret.NetInTransfer, ret.NetOutTransfer = netInTransfer, netOutTransfer
 	ret.NetInSpeed, ret.NetOutSpeed = netInSpeed, netOutSpeed
 	ret.Uptime = uint64(time.Since(cachedBootTime).Seconds())
-	ret.TcpConnCount, ret.UdpConnCount = getConns(skipConnectionCount)
+
+	if !skipConnectionCount {
+		ret.TcpConnCount, ret.UdpConnCount = getConns()
+	}
 
 	return &ret
 }
@@ -235,181 +190,96 @@ func GetState(skipConnectionCount bool, skipProcsCount bool) *model.HostState {
 // TrackNetworkSpeed NIC监控，统计流量与速度
 func TrackNetworkSpeed() {
 	var innerNetInTransfer, innerNetOutTransfer uint64
-	nc, err := net.IOCounters(true)
-	if err == nil {
-		for _, v := range nc {
-			if len(agentConfig.NICAllowlist) > 0 {
-				if !agentConfig.NICAllowlist[v.Name] {
-					continue
-				}
-			} else {
-				if isListContainsStr(excludeNetInterfaces, v.Name) {
-					continue
-				}
-			}
-			innerNetInTransfer += v.BytesRecv
-			innerNetOutTransfer += v.BytesSent
-		}
-		now := uint64(time.Now().Unix())
-		diff := now - lastUpdateNetStats
-		if diff > 0 {
-			netInSpeed = (innerNetInTransfer - netInTransfer) / diff
-			netOutSpeed = (innerNetOutTransfer - netOutTransfer) / diff
-		}
-		netInTransfer = innerNetInTransfer
-		netOutTransfer = innerNetOutTransfer
-		lastUpdateNetStats = now
-	}
-}
 
-func getDiskTotalAndUsed() (total uint64, used uint64) {
-	devices := make(map[string]string)
-
-	if len(agentConfig.HardDrivePartitionAllowlist) > 0 {
-		// 如果配置了白名单，使用白名单的列表
-		for i, v := range agentConfig.HardDrivePartitionAllowlist {
-			devices[strconv.Itoa(i)] = v
-		}
-	} else {
-		// 否则使用默认过滤规则
-		diskList, _ := disk.Partitions(false)
-		for _, d := range diskList {
-			fsType := strings.ToLower(d.Fstype)
-			// 不统计 K8s 的虚拟挂载点：https://github.com/shirou/gopsutil/issues/1007
-			if devices[d.Device] == "" && isListContainsStr(expectDiskFsTypes, fsType) && !strings.Contains(d.Mountpoint, "/var/lib/kubelet") {
-				devices[d.Device] = d.Mountpoint
-			}
-		}
-	}
-
-	for _, mountPath := range devices {
-		diskUsageOf, err := disk.Usage(mountPath)
-		if err == nil {
-			total += diskUsageOf.Total
-			used += diskUsageOf.Used
-		}
-	}
-
-	// Fallback 到这个方法,仅统计根路径,适用于OpenVZ之类的.
-	if runtime.GOOS == "linux" && total == 0 && used == 0 {
-		cmd := exec.Command("df")
-		out, err := cmd.CombinedOutput()
-		if err == nil {
-			s := strings.Split(string(out), "\n")
-			for _, c := range s {
-				info := strings.Fields(c)
-				if len(info) == 6 {
-					if info[5] == "/" {
-						total, _ = strconv.ParseUint(info[1], 0, 64)
-						used, _ = strconv.ParseUint(info[2], 0, 64)
-						// 默认获取的是1K块为单位的.
-						total = total * 1024
-						used = used * 1024
-					}
-				}
-			}
-		}
-	}
-
-	return
-}
-
-func getConns(skipConnectionCount bool) (tcpConnCount, udpConnCount uint64) {
-	if !skipConnectionCount {
-		ss_err := true
-		if runtime.GOOS == "linux" {
-			tcpStat, err_tcp := goss.ConnectionsWithProtocol(goss.AF_INET, syscall.IPPROTO_TCP)
-			udpStat, err_udp := goss.ConnectionsWithProtocol(goss.AF_INET, syscall.IPPROTO_UDP)
-			if err_tcp == nil && err_udp == nil {
-				ss_err = false
-				tcpConnCount = uint64(len(tcpStat))
-				udpConnCount = uint64(len(udpStat))
-			}
-			if strings.Contains(CachedIP, ":") {
-				tcpStat6, err_tcp := goss.ConnectionsWithProtocol(goss.AF_INET6, syscall.IPPROTO_TCP)
-				udpStat6, err_udp := goss.ConnectionsWithProtocol(goss.AF_INET6, syscall.IPPROTO_UDP)
-				if err_tcp == nil && err_udp == nil {
-					ss_err = false
-					tcpConnCount += uint64(len(tcpStat6))
-					udpConnCount += uint64(len(udpStat6))
-				}
-			}
-		}
-		if ss_err {
-			conns, _ := net.Connections("all")
-			for i := 0; i < len(conns); i++ {
-				switch conns[i].Type {
-				case syscall.SOCK_STREAM:
-					tcpConnCount++
-				case syscall.SOCK_DGRAM:
-					udpConnCount++
-				}
-			}
-		}
-	}
-	return tcpConnCount, udpConnCount
-}
-
-func updateGPUStat(gpuStat *uint64) {
-	if !atomic.CompareAndSwapInt32(&updateGPUStatus, 0, 1) {
+	ctx := context.WithValue(context.Background(), nic.NICKey, agentConfig.NICAllowlist)
+	nc, err := nic.GetState(ctx)
+	if err != nil {
 		return
 	}
-	defer atomic.StoreInt32(&updateGPUStatus, 0)
 
-	if statDataFetchAttempts["GPU"] < maxDeviceDataFetchAttempts {
-		gs, err := gpustat.GetGPUStat()
-		if err != nil {
-			statDataFetchAttempts["GPU"]++
-			println("gpustat.GetGPUStat error: ", err, ", attempt: ", statDataFetchAttempts["GPU"])
-			atomicStoreFloat64(gpuStat, gs)
-		} else {
-			statDataFetchAttempts["GPU"] = 0
-			atomicStoreFloat64(gpuStat, gs)
-		}
+	innerNetInTransfer = nc[0]
+	innerNetOutTransfer = nc[1]
+
+	now := uint64(time.Now().Unix())
+	diff := now - lastUpdateNetStats
+	if diff > 0 {
+		netInSpeed = (innerNetInTransfer - netInTransfer) / diff
+		netOutSpeed = (innerNetOutTransfer - netOutTransfer) / diff
 	}
+	netInTransfer = innerNetInTransfer
+	netOutTransfer = innerNetOutTransfer
+	lastUpdateNetStats = now
+}
+
+func getDiskTotal() uint64 {
+	ctx := context.WithValue(context.Background(), disk.DiskKey, agentConfig.HardDrivePartitionAllowlist)
+	total, _ := disk.GetHost(ctx)
+
+	return total
+}
+
+func getDiskUsed() uint64 {
+	ctx := context.WithValue(context.Background(), disk.DiskKey, agentConfig.HardDrivePartitionAllowlist)
+	used, _ := disk.GetState(ctx)
+
+	return used
+}
+
+func getConns() (tcpConnCount, udpConnCount uint64) {
+	connStat, err := conn.GetState(context.Background())
+	if err != nil {
+		return
+	}
+
+	if len(connStat) < 2 {
+		return
+	}
+
+	return connStat[0], connStat[1]
 }
 
 func updateTemperatureStat() {
-	if !atomic.CompareAndSwapInt32(&updateTempStatus, 0, 1) {
+	if !updateTempStatus.CompareAndSwap(false, true) {
 		return
 	}
-	defer atomic.StoreInt32(&updateTempStatus, 0)
+	defer updateTempStatus.Store(false)
 
-	if statDataFetchAttempts["Temperatures"] < maxDeviceDataFetchAttempts {
-		temperatures, err := sensors.SensorsTemperatures()
+	stat := tryStat(context.Background(), Temperatures, temperature.GetState)
+	temperatureStat = stat
+}
+
+type hostStateFunc[T any] func(context.Context) (T, error)
+
+func tryHost[T any](ctx context.Context, typ uint8, f hostStateFunc[T]) T {
+	var val T
+
+	if hostDataFetchAttempts[typ] < maxDeviceDataFetchAttempts {
+		v, err := f(ctx)
 		if err != nil {
-			statDataFetchAttempts["Temperatures"]++
-			println("host.SensorsTemperatures error: ", err, ", attempt: ", statDataFetchAttempts["Temperatures"])
+			hostDataFetchAttempts[typ]++
+			printf("monitor error: %v, attempt: %d", err, hostDataFetchAttempts[typ])
+			return val
 		} else {
-			statDataFetchAttempts["Temperatures"] = 0
-			tempStat := []model.SensorTemperature{}
-			for _, t := range temperatures {
-				if t.Temperature > 0 {
-					tempStat = append(tempStat, model.SensorTemperature{
-						Name:        t.SensorKey,
-						Temperature: t.Temperature,
-					})
-				}
-			}
-
-			temperatureStat = tempStat
+			val = v
+			hostDataFetchAttempts[typ] = 0
 		}
 	}
+	return val
 }
 
-func isListContainsStr(list []string, str string) bool {
-	for i := 0; i < len(list); i++ {
-		if strings.Contains(str, list[i]) {
-			return true
+func tryStat[T any](ctx context.Context, typ uint8, f hostStateFunc[T]) T {
+	var val T
+
+	if statDataFetchAttempts[typ] < maxDeviceDataFetchAttempts {
+		v, err := f(ctx)
+		if err != nil {
+			statDataFetchAttempts[typ]++
+			printf("monitor error: %v, attempt: %d", err, statDataFetchAttempts[typ])
+			return val
+		} else {
+			val = v
+			statDataFetchAttempts[typ] = 0
 		}
 	}
-	return false
-}
-
-func atomicStoreFloat64(x *uint64, v float64) {
-	atomic.StoreUint64(x, math.Float64bits(v))
-}
-
-func println(v ...interface{}) {
-	util.Println(agentConfig.Debug, v...)
+	return val
 }

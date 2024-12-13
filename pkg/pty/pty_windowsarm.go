@@ -10,11 +10,14 @@ import (
 	"github.com/UserExistsError/conpty"
 )
 
+var _ IPty = (*Pty)(nil)
+
 type Pty struct {
 	tty *conpty.ConPty
 }
 
-func DownloadDependency() {
+func DownloadDependency() error {
+	return nil
 }
 
 func getExecutableFilePath() (string, error) {
@@ -25,7 +28,7 @@ func getExecutableFilePath() (string, error) {
 	return filepath.Dir(ex), nil
 }
 
-func Start() (*Pty, error) {
+func Start() (IPty, error) {
 	shellPath, err := exec.LookPath("powershell.exe")
 	if err != nil || shellPath == "" {
 		shellPath = "cmd.exe"
@@ -44,6 +47,10 @@ func (pty *Pty) Write(p []byte) (n int, err error) {
 
 func (pty *Pty) Read(p []byte) (n int, err error) {
 	return pty.tty.Read(p)
+}
+
+func (pty *Pty) Getsize() (uint16, uint16, error) {
+	return 80, 40, nil
 }
 
 func (pty *Pty) Setsize(cols, rows uint32) error {
